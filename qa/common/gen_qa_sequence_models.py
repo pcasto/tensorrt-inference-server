@@ -120,6 +120,31 @@ def np_to_trt_dtype(np_dtype):
         return trt.infer.DataType.FLOAT
     return None
 
+def np_to_torch_dtype(np_dtype):
+    if np_dtype == np.bool:
+        return torch.bool
+    elif np_dtype == np.int8:
+        return torch.int8
+    elif np_dtype == np.int16:
+        return torch.int16
+    elif np_dtype == np.int32:
+        return torch.int
+    elif np_dtype == np.int64:
+        return torch.long
+    elif np_dtype == np.uint8:
+        return torch.uint8
+    elif np_dtype == np.uint16:
+        return None # Not supported in Torch
+    elif np_dtype == np.float16:
+        return torch.half
+    elif np_dtype == np.float32:
+        return torch.float
+    elif np_dtype == np.float64:
+        return torch.double
+    elif np_dtype == np_dtype_string:
+        return None # Not supported in Torch
+    return None
+
 def create_tf_modelfile(
         create_savedmodel, models_dir, model_version, max_batch, dtype, shape):
 
@@ -497,6 +522,115 @@ instance_group [
         cfile.write(config)
 
 
+def create_libtorch_modelfile(
+        models_dir, model_version, max_batch, dtype, shape):
+
+    if not tu.validate_for_libtorch_model(dtype, dtype, dtype, shape, shape, shape):
+        return
+
+    torch_dtype = np_to_torch_dtype(dtype)
+
+    class SequenceNet(nn.Module):
+        def __init__(self, *args):
+            super(SequenceNet, self).__init__()
+            self.acc = args
+            self.dtype = torch_dtype
+        def forward(self, input0, start0, ready0):
+            if torch.equal(start0, torch.ones(1)):
+                tmp = input0
+            else:
+                tmp = self.acc + input0
+            if torch.equal(ready0, torch.ones(1)):
+                self.acc = tmp
+            return self.acc
+
+    sequenceModel = SequenceNet(torch.zeros(shape, dtype=torch_dtype))
+    example_input = torch.zeros(shape, dtype=torch_dtype)
+    traced = torch.jit.trace(sequenceModel, (example_input,example_input,example_input))
+
+    model_name = tu.get_sequence_model_name(
+        "libtorch_nobatch" if max_batch == 0 else "libtorch", dtype)
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass # ignore existing dir
+
+    lengine.save(model_version_dir + "/model.plan")
+
+
+def create_libtorch_modelconfig(
+        models_dir, model_version, max_batch, dtype, shape):
+
+    if not tu.validate_for_libtorch_model(dtype, dtype, dtype, shape, shape, shape):
+        return
+
+    model_name = tu.get_sequence_model_name(
+        "libtorch_nobatch" if max_batch == 0 else "libtorch", dtype)
+    config_dir = models_dir + "/" + model_name
+    #  FIX FOR LibTorch
+    config = '''
+name: "{}"
+platform: "pytorch_libtorch"
+max_batch_size: {}
+sequence_batching {{
+  max_sequence_idle_microseconds: 5000000
+  control_input [
+    {{
+      name: "START"
+      control [
+        {{
+          kind: CONTROL_SEQUENCE_START
+          {}_false_true: [ 0, 1 ]
+        }}
+      ]
+    }},
+    {{
+      name: "READY"
+      control [
+        {{
+          kind: CONTROL_SEQUENCE_READY
+          {}_false_true: [ 0, 1 ]
+        }}
+      ]
+    }}
+  ]
+}}
+input [
+  {{
+    name: "INPUT"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+output [
+  {{
+    name: "OUTPUT"
+    data_type: {}
+    dims: [ 1, 1, 1 ]
+  }}
+]
+instance_group [
+  {{
+    kind: KIND_GPU
+  }}
+]
+'''.format(model_name, max_batch,
+           "int32" if dtype == np.int32 else "fp32",
+           "int32" if dtype == np.int32 else "fp32",
+           np_to_model_dtype(dtype), tu.shape_to_dims_str(shape),
+           np_to_model_dtype(dtype))
+
+    try:
+        os.makedirs(config_dir)
+    except OSError as ex:
+        pass # ignore existing dir
+
+    with open(config_dir + "/config.pbtxt", "w") as cfile:
+        cfile.write(config)
+
+
 def create_models(models_dir, dtype, shape, no_batch=True):
     model_version = 1
 
@@ -527,6 +661,13 @@ def create_models(models_dir, dtype, shape, no_batch=True):
         if no_batch:
             create_plan_modelconfig(models_dir, model_version, 0, dtype, shape + [1, 1])
             create_plan_modelfile(models_dir, model_version, 0, dtype, shape + [1, 1])
+
+    if FLAGS.libtorch:
+        create_libtorch_modelconfig(models_dir, model_version, 8, dtype, shape + [1, 1])
+        create_libtorch_modelfile(models_dir, model_version, 8, dtype, shape + [1, 1])
+        if no_batch:
+            create_libtorch_modelconfig(models_dir, model_version, 0, dtype, shape + [1, 1])
+            create_libtorch_modelfile(models_dir, model_version, 0, dtype, shape + [1, 1])
 
     if FLAGS.ensemble:
         for pair in emu.platform_types_and_validation():
@@ -559,6 +700,8 @@ if __name__ == '__main__':
                         help='Generate NetDef models')
     parser.add_argument('--tensorrt', required=False, action='store_true',
                         help='Generate TensorRT PLAN models')
+    parser.add_argument('--libtorch', required=False, action='store_true',
+                        help='Generate Pytorch LibTorch models')
     parser.add_argument('--variable', required=False, action='store_true',
                         help='Used variable-shape tensors for input/output')
     parser.add_argument('--ensemble', required=False, action='store_true',
@@ -575,6 +718,9 @@ if __name__ == '__main__':
         from tensorflow.python.framework import graph_io, graph_util
     if FLAGS.tensorrt:
         import tensorrt.legacy as trt
+    if FLAGS.libtorch:
+        import torch
+        from torch import nn
 
     import test_util as tu
 
